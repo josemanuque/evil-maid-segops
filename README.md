@@ -10,20 +10,24 @@ Educational evil maid attack toolkit targeting Ubuntu 22.04 with LUKS full-disk 
 LUKS encrypts everything except `/boot`. The attack plants a hook inside the unencrypted initramfs. On next boot the victim types their passphrase as usual — LUKS unlocks, and the hook fires silently inside the initramfs before the OS takes over. It copies the reverse shell binary onto the real root filesystem and registers it as a persistent systemd service.
 
 ```
-[Attacker]                          [Victim machine]
-    |                                       |
-    |-- 1. Compile em_shell (CI) ---------> |
-    |-- 2. Boot victim with live USB        |
-    |-- 3. Run poison_boot.sh              |
-    |       └─ mounts /boot                |
-    |       └─ injects hook into initramfs |
-    |       └─ repacks + replaces initrd   |
-    |-- 4. Reboot victim (remove USB)      |
-    |                                [victim enters LUKS passphrase]
-    |                                [initramfs hook fires]
-    |                                [em_shell installed + service started]
-    |-- 5. Run em_listener.py <----------  em_shell connects back
-    |       └─ interactive shell           |
+[Attacker]                             [Victim machine]
+    |                                          |
+    |-- 1. Build em_shell binary               |
+    |       └─ embed attacker IP + port        |
+    |                                          |
+    |        ~~ physical access ~~             |
+    |-- 2. Boot victim from live USB --------> |
+    |-- 3. Run poison_boot.sh                  |
+    |       └─ mounts /boot                    |
+    |       └─ injects hook into initramfs     |
+    |       └─ repacks + replaces initrd       |
+    |-- 4. Remove USB, reboot victim --------> |
+    |                                   [victim enters LUKS passphrase]
+    |                                   [initramfs hook fires silently]
+    |                                   [em_shell installed as service]
+    |        ~~ remote access ~~               |
+    |-- 5. Run em_listener.py <-----------  em_shell dials back
+    |       └─ interactive shell               |
 ```
 
 ---
